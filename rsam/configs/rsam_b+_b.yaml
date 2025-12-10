@@ -1,0 +1,351 @@
+# @package _global_
+
+scratch:
+  resolution: 800
+  train_batch_size: 8
+  val_batch_size: 32
+  num_train_workers: 4
+  num_val_workers: 4
+  num_frames: 1
+  max_num_objects_per_sample: 4
+  max_num_objects_total: 24
+  base_lr: 5e-5
+  vision_lr: 3e-5
+  text_lr: 0.0
+  description_lr: 5e-5
+  phases_per_epoch: 1
+  num_epochs: 60
+
+train_dataset:
+  img_folder: data/RISORS/JPEGImages # PATH to JPEGImages folder
+  gt_folder: data/RISORS/Annotations  # PATH to Annotations folder
+  file_list_txt: data/RISORS/RISORS_train.txt # PATH to filelist containing a subset
+
+val_dataset:
+  img_folder: data/RISORS/JPEGImages # PATH to JPEGImages folder
+  gt_folder: data/RISORS/Annotations  # PATH to Annotations folder
+  file_list_txt: dataset/RISORS/RISORS_val.txt # PATH to filelist containing a subset
+  phase: val
+
+test_dataset:
+  img_folder: data/RISORS/JPEGImages # PATH to JPEGImages folder
+  gt_folder: data/RISORS/Annotations  # PATH to Annotations folder
+  file_list_txt: data/RISORS/RISORS_test.txt # PATH to filelist containing a subset
+  phase: test
+
+# transforms
+vos:
+  train_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: true
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.RandomBlackBoxesAPI
+          prob: 0.2
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+  val_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: true
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+trainer:
+  _target_: training.trainer.Trainer
+  mode: train
+  max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
+  accelerator: cuda
+  seed_value: 123
+
+  model:
+    _target_: training.model.rsam.RSAM
+    image_encoder:
+      _target_: rsam.modeling.backbones.image_encoder.ImageEncoder
+      scalp: 1
+      trunk:
+        _target_: rsam.modeling.backbones.hieradet.Hiera
+        embed_dim: 112
+        num_heads: 2
+        drop_path_rate: 0.1
+      neck:
+        _target_: rsam.modeling.backbones.image_encoder.FpnNeck
+        position_encoding:
+          _target_: rsam.modeling.position_encoding.PositionEmbeddingSine
+          num_pos_feats: 256
+          normalize: true
+          scale: null
+          temperature: 10000
+        d_model: 256
+        backbone_channel_list: [896, 448, 224, 112]
+        fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
+        fpn_interp_model: nearest
+
+    text_encoder:
+      _target_: rsam.modeling.bert.bert.built_bert
+      config_path: ./rsam/modeling/bert/bert.json
+
+    num_maskmem: 0
+    image_size: ${scratch.resolution}
+    # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
+    sigmoid_scale_for_mem_enc: 20.0
+    sigmoid_bias_for_mem_enc: -10.0
+    use_mask_input_as_output_without_sam: false
+    # use high-resolution feature map in the SAM mask decoder
+    use_high_res_features_in_sam: true
+    # output 3 masks on the first click on initial conditioning frames
+    multimask_output_in_sam: false
+    # SAM heads
+    iou_prediction_use_sigmoid: true
+    # cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
+    use_obj_ptrs_in_encoder: true
+    add_tpos_enc_to_obj_ptrs: true
+    proj_tpos_enc_in_obj_ptrs: true
+    use_signed_tpos_enc_to_obj_ptrs: true
+    only_obj_ptrs_in_the_past_for_eval: true
+    # object occlusion prediction
+    pred_obj_scores: true
+    pred_obj_scores_mlp: true
+    fixed_no_obj_ptr: true
+    # multimask tracking settings
+    multimask_output_for_tracking: true
+    use_multimask_token_for_obj_ptr: true
+    multimask_min_pt_num: 0
+    multimask_max_pt_num: 1
+    use_mlp_for_obj_ptr_proj: true
+    # Freeze flag
+    freeze_image_encoder: false
+    freeze_text_encoder: true
+    # Compilation flag
+    # compile_image_encoder: true
+    # compile_text_encoder: true
+
+    ####### Training specific params #######
+    # box/point input and corrections
+    prob_to_use_pt_input_for_train: 0.0
+    prob_to_use_pt_input_for_eval: 0.0
+    prob_to_use_box_input_for_train: 0.0  # 0.5*0.5 = 0.25 prob to use box instead of points
+    prob_to_use_box_input_for_eval: 0.0
+    prob_to_use_descript_input_for_train: 1.0
+    prob_to_use_descript_input_for_eval: 1.0
+    prob_to_sample_from_gt_for_train: 0.1  # with a small prob, sampling correction points from GT mask instead of prediction errors
+    num_frames_to_correct_for_train: 1  # iteratively sample on random 1~2 frames (always include the first frame)
+    num_frames_to_correct_for_eval: 0  # only iteratively sample on first frame
+    rand_frames_to_correct_for_train: false  # random #init-cond-frame ~ 2
+    add_all_frames_to_correct_as_cond: true  # when a frame receives a correction click, it becomes a conditioning frame (even if it's not initially a conditioning frame)
+    # maximum 2 initial conditioning frames
+    num_init_cond_frames_for_train: 1
+    rand_init_cond_frames_for_train: false  # random 1~2
+    num_correction_pt_per_frame: 7
+    use_act_ckpt_iterative_pt_sampling: false
+
+    num_init_cond_frames_for_eval: 1  # only mask on the first frame
+    forward_backbone_per_frame_for_eval: true
+
+  data:
+    train:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: ${scratch.phases_per_epoch}
+      batch_sizes:
+        - ${scratch.train_batch_size}
+      datasets:
+        - _target_: training.dataset.vos_dataset.VOSDataset
+          transforms: ${vos.train_transforms}
+          training: true
+          video_dataset:
+            _target_: training.dataset.risors_dataset.RISORSDataset
+            img_folder: ${train_dataset.img_folder}
+            gt_folder: ${train_dataset.gt_folder}
+            file_list_txt: ${train_dataset.file_list_txt}
+            negative_to_positive_ratio: 1.0
+          sampler:
+            _target_: training.dataset.vos_sampler.RandomUniformSampler
+            num_frames: ${scratch.num_frames}
+            max_num_objects: ${scratch.max_num_objects_per_sample}
+      shuffle: true
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: true
+      drop_last: true
+    test:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: ${scratch.phases_per_epoch}
+      batch_sizes:
+        - ${scratch.val_batch_size}
+      datasets:
+        - _target_: training.dataset.vos_dataset.VOSDataset
+          transforms: ${vos.train_transforms}
+          training: false
+          video_dataset:
+            _target_: training.dataset.risors_dataset.RISORSDataset
+            img_folder: ${test_dataset.img_folder}
+            gt_folder: ${test_dataset.gt_folder}
+            file_list_txt: ${test_dataset.file_list_txt}
+            negative_to_positive_ratio: 0.0
+          sampler:
+            _target_: training.dataset.vos_sampler.EvalSampler
+      shuffle: False
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: true
+      drop_last: False
+    collate_fn:
+      _target_: training.utils.data_utils.collate_fn
+      _partial_: true
+      dict_key: all
+      max_tokens: 47
+    tokenizer:
+      _target_: rsam.modeling.bert.tokenization.BertTokenizer.from_pretrained
+      pretrained_model_name_or_path: ./rsam/configs/tokenizer_bert
+    max_num_objects_total: ${scratch.max_num_objects_total}
+
+  optim:
+    amp:
+      enabled: true
+      amp_dtype: bfloat16
+
+    optimizer:
+      _target_: torch.optim.AdamW
+
+    gradient_clip:
+      _target_: training.optimizer.GradientClipper
+      max_norm: 0.1
+      norm_type: 2
+
+    param_group_modifiers:
+      - _target_: training.optimizer.layer_decay_param_modifier
+        _partial_: true
+        layer_decay_value: 0.9
+        apply_to: 'image_encoder.trunk'
+        overrides:
+          - pattern: '*pos_embed*'
+            value: 1.0
+
+    options:
+      lr:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: ${scratch.base_lr}
+            end_value: ${divide:${scratch.base_lr},10}
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: ${scratch.vision_lr}
+            end_value: ${divide:${scratch.vision_lr},10}
+          param_names:
+            - 'image_encoder.*'
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: ${scratch.text_lr}
+            end_value: ${divide:${scratch.text_lr},10}
+          param_names:
+            - 'text_encoder.*'
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: ${scratch.description_lr}
+            end_value: ${divide:${scratch.description_lr},20}
+          param_names:
+            - 'description_transformer.*'
+            - '*description_pe*'
+      weight_decay:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.1
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - '*bias*'
+          module_cls_names: ['torch.nn.LayerNorm']
+
+  loss:
+    all:
+      _target_: training.loss_fns.MultiStepMultiMasksAndIous
+      weight_dict:
+        loss_mask: 20
+        loss_dice: 1
+        loss_iou: 1
+        loss_class: 1
+      supervise_all_iou: true
+      iou_use_l1_loss: true
+      pred_obj_scores: true
+      focal_gamma_obj_score: 0.0
+      focal_alpha_obj_score: -1.0
+
+  meters:
+    val:
+      all:
+        dice:
+          _target_: training.utils.train_utils.DiceMeter
+          name: mDice
+          average: micro
+          mdmc_average: samplewise
+        iou:
+          _target_: training.utils.train_utils.IoUMeter
+    test:
+      all:
+        dice:
+          _target_: training.utils.train_utils.DiceMeter
+          name: mDice
+          average: micro
+          mdmc_average: samplewise
+        iou:
+          _target_: training.utils.train_utils.IoUMeter
+        precision:
+          _target_: training.utils.train_utils.PrecisionMeter
+
+  distributed:
+    backend: nccl
+    find_unused_parameters: true
+
+  logging:
+    tensorboard_writer:
+      _target_: training.utils.logger.make_tensorboard_logger
+      log_dir:  ${launcher.experiment_log_dir}/tensorboard
+      flush_secs: 120
+      should_log: true
+    log_dir: ${launcher.experiment_log_dir}/logs
+    log_freq: 50
+
+  # initialize from a SAM 2 checkpoint
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 0 # 0 only last checkpoint is saved.
+    model_weight_initializer:
+      _partial_: true
+      _target_: training.utils.checkpoint_utils.load_state_dict_into_model
+      strict: false
+      ignore_unexpected_keys: null
+      ignore_missing_keys: null
+      checkpoint_kernels:
+        - _target_: training.utils.checkpoint_utils.CkptRsamInitKernel
+      state_dict:
+        _target_: training.utils.checkpoint_utils.load_checkpoints
+        checkpoints:
+        - checkpoint_path: ./checkpoints/sam2.1_hiera_base_plus.pt # PATH to checkpoint
+          ckpt_state_dict_keys: ['model']
+        - checkpoint_path: ./checkpoints/bert-base.bin # PATH to checkpoint
+    save_best_meters:
+      - test_all/iou
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 4
+  experiment_log_dir: null # Path to log directory, defaults to ./sam2_logs/${config_name}
+
+# SLURM args if running on a cluster
+submitit:
+  partition: null
+  account: null
+  qos: null
+  cpus_per_task: 10
+  use_cluster: false
+  timeout_hour: 24
+  name: null
+  port_range: [10000, 65000]
